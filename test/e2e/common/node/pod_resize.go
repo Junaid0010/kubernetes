@@ -18,30 +18,208 @@ package node
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"k8s.io/klog/v2"
+	"net/http"
+	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/kubernetes/pkg/cluster/ports"
+	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
+	kubecm "k8s.io/kubernetes/pkg/kubelet/cm"
+	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
 	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
-
-	"github.com/onsi/ginkgo/v2"
-	"github.com/onsi/gomega"
-	v1 "k8s.io/api/core/v1"
+	e2enodekubelet "k8s.io/kubernetes/test/e2e_node/kubeletconfig"
+	admissionapi "k8s.io/pod-security-admission/api"
+	"k8s.io/utils/cpuset"
 )
 
 const (
 	fakeExtendedResource = "dummy.com/dummy"
+	// state files
+	cpuManagerStateFile    = "/var/lib/kubelet/cpu_manager_state"
+	memoryManagerStateFile = "/var/lib/kubelet/memory_manager_state"
 )
+
+var (
+	kubeletHealthCheckURL    = fmt.Sprintf("http://127.0.0.1:%d/healthz", ports.KubeletHealthzPort)
+	containerRuntimeUnitName = ""
+	// KubeletConfig is the kubelet configuration the test is running against.
+	kubeletCfg *kubeletconfig.KubeletConfiguration
+)
+
+type cpuManagerKubeletArguments struct {
+	policyName              string
+	enableCPUManagerOptions bool
+	reservedSystemCPUs      cpuset.CPUSet
+	options                 map[string]string
+}
+
+func deleteStateFile(stateFileName string) {
+	err := exec.Command("/bin/sh", "-c", fmt.Sprintf("rm -f %s", stateFileName)).Run()
+	framework.ExpectNoError(err, "failed to delete the state file")
+}
+
+func waitForKubeletToStart(ctx context.Context, f *framework.Framework) {
+	// wait until the kubelet health check will succeed
+	gomega.Eventually(ctx, func() bool {
+		return kubeletHealthCheck(kubeletHealthCheckURL)
+	}, 2*time.Minute, 5*time.Second).Should(gomega.BeTrueBecause("expected kubelet to be in healthy state"))
+
+	// Wait for the Kubelet to be ready.
+	gomega.Eventually(ctx, func(ctx context.Context) bool {
+		nodes, err := e2enode.TotalReady(ctx, f.ClientSet)
+		framework.ExpectNoError(err)
+		return nodes == 1
+	}, time.Minute, time.Second).Should(gomega.BeTrueBecause("expected kubelet to be in ready state"))
+}
+
+func kubeletHealthCheck(url string) bool {
+	insecureTransport := http.DefaultTransport.(*http.Transport).Clone()
+	insecureTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	insecureHTTPClient := &http.Client{
+		Transport: insecureTransport,
+	}
+
+	req, err := http.NewRequest("HEAD", url, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", framework.TestContext.BearerToken))
+	resp, err := insecureHTTPClient.Do(req)
+	if err != nil {
+		klog.Warningf("Health check on %q failed, error=%v", url, err)
+	} else if resp.StatusCode != http.StatusOK {
+		klog.Warningf("Health check on %q failed, status=%d", url, resp.StatusCode)
+	}
+	return err == nil && resp.StatusCode == http.StatusOK
+}
+
+func updateKubeletConfig(ctx context.Context, f *framework.Framework, kubeletConfig *kubeletconfig.KubeletConfiguration, deleteStateFiles bool) {
+	// Update the Kubelet configuration.
+	ginkgo.By("Stopping the kubelet")
+	startKubelet := stopKubelet()
+
+	// wait until the kubelet health check will fail
+	gomega.Eventually(ctx, func() bool {
+		return kubeletHealthCheck(kubeletHealthCheckURL)
+	}, time.Minute, time.Second).Should(gomega.BeFalseBecause("expected kubelet health check to be failed"))
+
+	// Delete CPU and memory manager state files to be sure it will not prevent the kubelet restart
+	if deleteStateFiles {
+		deleteStateFile(cpuManagerStateFile)
+		deleteStateFile(memoryManagerStateFile)
+	}
+
+	framework.ExpectNoError(e2enodekubelet.WriteKubeletConfigFile(kubeletConfig))
+
+	ginkgo.By("Starting the kubelet")
+	startKubelet()
+	waitForKubeletToStart(ctx, f)
+}
+
+// stopKubelet will kill the running kubelet, and returns a func that will restart the process again
+func stopKubelet() func() {
+	kubeletServiceName := findKubeletServiceName(true)
+
+	// reset the kubelet service start-limit-hit
+	stdout, err := exec.Command("sudo", "systemctl", "reset-failed", kubeletServiceName).CombinedOutput()
+	framework.ExpectNoError(err, "Failed to reset kubelet start-limit-hit with systemctl: %v, %s", err, string(stdout))
+
+	stdout, err = exec.Command("sudo", "systemctl", "kill", kubeletServiceName).CombinedOutput()
+	framework.ExpectNoError(err, "Failed to stop kubelet with systemctl: %v, %s", err, string(stdout))
+
+	return func() {
+		// we should restart service, otherwise the transient service start will fail
+		stdout, err := exec.Command("sudo", "systemctl", "restart", kubeletServiceName).CombinedOutput()
+		framework.ExpectNoError(err, "Failed to restart kubelet with systemctl: %v, %v", err, stdout)
+	}
+}
+
+func getLocalNodeCPUDetails(ctx context.Context, f *framework.Framework) (cpuCapVal int64, cpuAllocVal int64, cpuResVal int64) {
+	localNodeCap := getLocalNode(ctx, f).Status.Capacity
+	cpuCap := localNodeCap[v1.ResourceCPU]
+	localNodeAlloc := getLocalNode(ctx, f).Status.Allocatable
+	cpuAlloc := localNodeAlloc[v1.ResourceCPU]
+	cpuRes := cpuCap.DeepCopy()
+	cpuRes.Sub(cpuAlloc)
+
+	// RoundUp reserved CPUs to get only integer cores.
+	cpuRes.RoundUp(0)
+
+	return cpuCap.Value(), cpuCap.Value() - cpuRes.Value(), cpuRes.Value()
+}
+
+func getLocalNode(ctx context.Context, f *framework.Framework) *v1.Node {
+	nodeList, err := e2enode.GetReadySchedulableNodes(ctx, f.ClientSet)
+	framework.ExpectNoError(err)
+	gomega.Expect(nodeList.Items).Should(gomega.HaveLen(1), "Unexpected number of node objects for node e2e. Expects only one node.")
+	return &nodeList.Items[0]
+}
+
+func getSMTLevel() int {
+	cpuID := 0 // this is just the most likely cpu to be present in a random system. No special meaning besides this.
+	out, err := exec.Command("/bin/sh", "-c", fmt.Sprintf("cat /sys/devices/system/cpu/cpu%d/topology/thread_siblings_list | tr -d \"\n\r\"", cpuID)).Output()
+	framework.ExpectNoError(err)
+	// how many thread sibling you have = SMT level
+	// example: 2-way SMT means 2 threads sibling for each thread
+	cpus, err := cpuset.Parse(strings.TrimSpace(string(out)))
+	framework.ExpectNoError(err)
+	return cpus.Size()
+}
+
+func configureCPUManagerInKubelet(oldCfg *kubeletconfig.KubeletConfiguration, kubeletArguments *cpuManagerKubeletArguments) *kubeletconfig.KubeletConfiguration {
+	newCfg := oldCfg.DeepCopy()
+	if newCfg.FeatureGates == nil {
+		newCfg.FeatureGates = make(map[string]bool)
+	}
+
+	newCfg.FeatureGates["CPUManagerPolicyOptions"] = kubeletArguments.enableCPUManagerOptions
+	newCfg.FeatureGates["CPUManagerPolicyBetaOptions"] = kubeletArguments.enableCPUManagerOptions
+	newCfg.FeatureGates["CPUManagerPolicyAlphaOptions"] = kubeletArguments.enableCPUManagerOptions
+
+	newCfg.CPUManagerPolicy = kubeletArguments.policyName
+	newCfg.CPUManagerReconcilePeriod = metav1.Duration{Duration: 1 * time.Second}
+
+	if kubeletArguments.options != nil {
+		newCfg.CPUManagerPolicyOptions = kubeletArguments.options
+	}
+
+	if kubeletArguments.reservedSystemCPUs.Size() > 0 {
+		cpus := kubeletArguments.reservedSystemCPUs.String()
+		framework.Logf("configureCPUManagerInKubelet: using reservedSystemCPUs=%q", cpus)
+		newCfg.ReservedSystemCPUs = cpus
+	} else {
+		// The Kubelet panics if either kube-reserved or system-reserved is not set
+		// when CPU Manager is enabled. Set cpu in kube-reserved > 0 so that
+		// kubelet doesn't panic.
+		if newCfg.KubeReserved == nil {
+			newCfg.KubeReserved = map[string]string{}
+		}
+
+		if _, ok := newCfg.KubeReserved["cpu"]; !ok {
+			newCfg.KubeReserved["cpu"] = "200m"
+		}
+	}
+
+	return newCfg
+}
 
 func patchNode(ctx context.Context, client clientset.Interface, old *v1.Node, new *v1.Node) error {
 	oldData, err := json.Marshal(old)
@@ -115,7 +293,79 @@ func removeExtendedResource(clientSet clientset.Interface, nodeName, extendedRes
 	}).WithTimeout(30 * time.Second).WithPolling(time.Second).ShouldNot(gomega.HaveOccurred())
 }
 
-func doPodResizeTests(f *framework.Framework) {
+func cpuManagerPolicyKubeletConfig(ctx context.Context, f *framework.Framework, oldCfg *kubeletconfig.KubeletConfiguration, cpuManagerPolicyName string, cpuManagerPolicyOptions map[string]string) {
+	if cpuManagerPolicyName != "" {
+		if cpuManagerPolicyOptions != nil {
+			func() {
+				var cpuAlloc int64
+				for policyOption, policyOptionValue := range cpuManagerPolicyOptions {
+					if policyOption == cpumanager.FullPCPUsOnlyOption && policyOptionValue == "true" {
+						_, cpuAlloc, _ = getLocalNodeCPUDetails(ctx, f)
+						smtLevel := getSMTLevel()
+
+						// strict SMT alignment is trivially verified and granted on non-SMT systems
+						if smtLevel < 2 {
+							e2eskipper.Skipf("Skipping Pod Resize along side CPU Manager %s tests since SMT disabled", policyOption)
+						}
+
+						// our tests want to allocate a full core, so we need at last 2*2=4 virtual cpus
+						if cpuAlloc < int64(smtLevel*2) {
+							e2eskipper.Skipf("Skipping Pod resize along side CPU Manager %s tests since the CPU capacity < 4", policyOption)
+						}
+
+						framework.Logf("SMT level %d", smtLevel)
+						return
+					}
+				}
+			}()
+
+			// TODO: we assume the first available CPUID is 0, which is pretty fair, but we should probably
+			// check what we do have in the node.
+			newCfg := configureCPUManagerInKubelet(oldCfg,
+				&cpuManagerKubeletArguments{
+					policyName:              cpuManagerPolicyName,
+					reservedSystemCPUs:      cpuset.New(0),
+					enableCPUManagerOptions: true,
+					options:                 cpuManagerPolicyOptions,
+				},
+			)
+			updateKubeletConfig(ctx, f, newCfg, true)
+		} else {
+			var cpuCap int64
+			cpuCap, _, _ = getLocalNodeCPUDetails(ctx, f)
+			// Skip CPU Manager tests altogether if the CPU capacity < 2.
+			if cpuCap < 2 {
+				e2eskipper.Skipf("Skipping Pod Resize alongside CPU Manager tests since the CPU capacity < 2")
+			}
+			// Enable CPU Manager in the kubelet.
+			newCfg := configureCPUManagerInKubelet(oldCfg, &cpuManagerKubeletArguments{
+				policyName:         cpuManagerPolicyName,
+				reservedSystemCPUs: cpuset.CPUSet{},
+			})
+			updateKubeletConfig(ctx, f, newCfg, true)
+		}
+	}
+}
+
+type cpuManagerPolicyConfig struct {
+	name    string
+	title   string
+	options map[string]string
+}
+
+func doPodResizeTests(f *framework.Framework, policy cpuManagerPolicyConfig) {
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+	var podClient *e2epod.PodClient
+	var oldCfg *kubeletconfig.KubeletConfiguration
+	ginkgo.BeforeEach(func(ctx context.Context) {
+		var err error
+		podClient = e2epod.NewPodClient(f)
+		if oldCfg == nil {
+			oldCfg, err = e2enodekubelet.GetCurrentKubeletConfig(ctx, framework.TestContext.NodeName, "", false, framework.TestContext.StandaloneMode)
+			framework.ExpectNoError(err)
+		}
+	})
+
 	type testCase struct {
 		name                string
 		containers          []e2epod.ResizableContainerInfo
@@ -854,7 +1104,9 @@ func doPodResizeTests(f *framework.Framework) {
 
 	for idx := range tests {
 		tc := tests[idx]
-		ginkgo.It(tc.name, func(ctx context.Context) {
+		ginkgo.It(tc.name+policy.title, func(ctx context.Context) {
+			cpuManagerPolicyKubeletConfig(ctx, f, oldCfg, policy.name, policy.options)
+
 			podClient := e2epod.NewPodClient(f)
 			var testPod, patchedPod *v1.Pod
 			var pErr error
@@ -891,6 +1143,15 @@ func doPodResizeTests(f *framework.Framework) {
 			e2epod.VerifyPodStatusResources(newPod, tc.containers)
 			ginkgo.By("verifying initial cgroup config are as expected")
 			framework.ExpectNoError(e2epod.VerifyPodContainersCgroupValues(ctx, f, newPod, tc.containers))
+			// TODO make this dynamic depending on Policy Name, Resources input and topology of target
+			// machine.
+			// For the moment skip below if CPU Manager Policy is set to none
+			if policy.name == string(cpumanager.PolicyStatic) {
+				ginkgo.By("verifying initial pod Cpus allowed list value")
+				gomega.Eventually(ctx, verifyPodContainersCpusAllowedListValue, timeouts.PodStartShort, timeouts.Poll).
+					WithArguments(f, newPod, tc.containers).
+					Should(gomega.BeNil(), "failed to verify initial Pod CpusAllowedListValue")
+			}
 
 			patchAndVerify := func(patchString string, expectedContainers []e2epod.ResizableContainerInfo, initialContainers []e2epod.ResizableContainerInfo, opStr string, isRollback bool) {
 				ginkgo.By(fmt.Sprintf("patching pod for %s", opStr))
@@ -918,6 +1179,15 @@ func doPodResizeTests(f *framework.Framework) {
 				gomega.Eventually(ctx, e2epod.VerifyPodAllocations, timeouts.PodStartShort, timeouts.Poll).
 					WithArguments(resizedPod, expectedContainers).
 					Should(gomega.BeNil(), "failed to verify Pod allocations for resizedPod")
+				// TODO make this dynamic depending on Policy Name, Resources input and topology of target
+				// machine.
+				// For the moment skip below if CPU Manager Policy is set to none
+				if policy.name == string(cpumanager.PolicyStatic) {
+					ginkgo.By("verifying pod Cpus allowed list value after resize")
+					gomega.Eventually(ctx, verifyPodContainersCpusAllowedListValue, timeouts.PodStartShort, timeouts.Poll).
+						WithArguments(f, resizedPod, tc.expected).
+						Should(gomega.BeNil(), "failed to verify Pod CpusAllowedListValue for resizedPod")
+				}
 			}
 
 			patchAndVerify(tc.patchString, tc.expected, tc.containers, "resize", false)
@@ -931,6 +1201,11 @@ func doPodResizeTests(f *framework.Framework) {
 			podClient.DeleteSync(ctx, newPod.Name, metav1.DeleteOptions{}, timeouts.PodDelete)
 		})
 	}
+
+	ginkgo.AfterEach(func(ctx context.Context) {
+		updateKubeletConfig(ctx, f, oldCfg, true)
+	})
+
 }
 
 func doPodResizeErrorTests(f *framework.Framework) {
@@ -945,7 +1220,7 @@ func doPodResizeErrorTests(f *framework.Framework) {
 
 	tests := []testCase{
 		{
-			name: "BestEffort pod - try requesting memory, expect error",
+			name: "BestEffort QoS pod, one container - try requesting memory, expect error",
 			containers: []e2epod.ResizableContainerInfo{
 				{
 					Name: "c1",
@@ -961,6 +1236,35 @@ func doPodResizeErrorTests(f *framework.Framework) {
 				},
 			},
 		},
+		{
+			name: "BestEffort QoS pod, three containers - try requesting memory for c1, expect error",
+			containers: []e2epod.ResizableContainerInfo{
+				{
+					Name: "c1",
+				},
+				{
+					Name: "c2",
+				},
+				{
+					Name: "c3",
+				},
+			},
+			patchString: `{"spec":{"containers":[
+						{"name":"c1", "resources":{"requests":{"memory":"400Mi"}}}
+					]}}`,
+			patchError: "Pod QoS is immutable",
+			expected: []e2epod.ResizableContainerInfo{
+				{
+					Name: "c1",
+				},
+				{
+					Name: "c2",
+				},
+				{
+					Name: "c3",
+				},
+			},
+		},
 	}
 
 	timeouts := framework.NewTimeoutContext()
@@ -968,6 +1272,11 @@ func doPodResizeErrorTests(f *framework.Framework) {
 	for idx := range tests {
 		tc := tests[idx]
 		ginkgo.It(tc.name, func(ctx context.Context) {
+			ginkgo.By("waiting for the node to be ready", func() {
+				if !e2enode.supportsInPlacePodVerticalScaling(node) {
+					e2eskipper.Skipf("runtime does not support InPlacePodVerticalScaling -- skipping")
+				}
+			})
 			podClient := e2epod.NewPodClient(f)
 			var testPod, patchedPod *v1.Pod
 			var pErr error
@@ -1007,7 +1316,16 @@ func doPodResizeErrorTests(f *framework.Framework) {
 				Should(gomega.BeNil(), "failed to verify Pod allocations for patchedPod")
 
 			ginkgo.By("deleting pod")
-			podClient.DeleteSync(ctx, newPod.Name, metav1.DeleteOptions{}, timeouts.PodDelete)
+			gp := int64(0)
+			delOpts := metav1.DeleteOptions{
+				GracePeriodSeconds: &gp,
+			}
+			podClient.DeleteSync(ctx, newPod.Name, delOpts, timeouts.PodDelete)
+			// we need to wait for all containers to really be gone so cpumanager reconcile loop will not rewrite the cpu_manager_state.
+			// this is in turn needed because we will have an unavoidable (in the current framework) race with the
+			// reconcile loop which will make our attempt to delete the state file and to restore the old config go haywire
+			waitForAllContainerRemoval(ctx, newPod.Name, newPod.Namespace)
+
 		})
 	}
 }
@@ -1026,11 +1344,135 @@ var _ = SIGDescribe("Pod InPlace Resize Container", framework.WithSerial(), feat
 	ginkgo.BeforeEach(func(ctx context.Context) {
 		node, err := e2enode.GetRandomReadySchedulableNode(ctx, f.ClientSet)
 		framework.ExpectNoError(err)
-		if framework.NodeOSDistroIs("windows") || e2enode.IsARM64(node) {
+		if !e2enode.supportsInPlacePodVerticalScaling(node) {
 			e2eskipper.Skipf("runtime does not support InPlacePodVerticalScaling -- skipping")
 		}
 	})
 
-	doPodResizeTests(f)
+	policiesGeneralAvailability := []cpuManagerPolicyConfig{
+		{
+			name:  string(cpumanager.PolicyNone),
+			title: "",
+		},
+		{
+			name:  string(cpumanager.PolicyStatic),
+			title: ", alongside CPU Manager Static Policy with no options",
+			options: map[string]string{
+				cpumanager.FullPCPUsOnlyOption:             "false",
+				cpumanager.DistributeCPUsAcrossNUMAOption:  "false",
+				cpumanager.AlignBySocketOption:             "false",
+				cpumanager.DistributeCPUsAcrossCoresOption: "false",
+			},
+		},
+	}
+
+	for idp := range policiesGeneralAvailability {
+		doPodResizeTests(policiesGeneralAvailability[idp])
+	}
+
+	policiesBeta := []cpuManagerPolicyConfig{
+		{
+			name:  string(cpumanager.PolicyStatic),
+			title: ", alongside CPU Manager Static Policy with FullPCPUsOnlyOption",
+			options: map[string]string{
+				cpumanager.FullPCPUsOnlyOption:             "true",
+				cpumanager.DistributeCPUsAcrossNUMAOption:  "false",
+				cpumanager.AlignBySocketOption:             "false",
+				cpumanager.DistributeCPUsAcrossCoresOption: "false",
+			},
+		},
+	}
+
+	for idp := range policiesBeta {
+		doPodResizeTests(policiesBeta[idp])
+	}
+
+	/*policiesAlpha := []cpuManagerPolicyConfig{
+		{
+			name:  string(cpumanager.PolicyStatic),
+			title: ", alongside CPU Manager Static Policy with DistributeCPUsAcrossNUMAOption",
+			options: map[string]string{
+				cpumanager.FullPCPUsOnlyOption:             "false",
+				cpumanager.DistributeCPUsAcrossNUMAOption:  "true",
+				cpumanager.AlignBySocketOption:             "false",
+				cpumanager.DistributeCPUsAcrossCoresOption: "false",
+			},
+		},
+		{
+			name:  string(cpumanager.PolicyStatic),
+			title: ", alongside CPU Manager Static Policy with FullPCPUsOnlyOption, DistributeCPUsAcrossNUMAOption",
+			options: map[string]string{
+				cpumanager.FullPCPUsOnlyOption:             "true",
+				cpumanager.DistributeCPUsAcrossNUMAOption:  "true",
+				cpumanager.AlignBySocketOption:             "false",
+				cpumanager.DistributeCPUsAcrossCoresOption: "false",
+			},
+		},
+		{
+			name:  string(cpumanager.PolicyStatic),
+			title: ", alongside CPU Manager Static Policy with AlignBySocketOption",
+			options: map[string]string{
+				cpumanager.FullPCPUsOnlyOption:             "false",
+				cpumanager.DistributeCPUsAcrossNUMAOption:  "false",
+				cpumanager.AlignBySocketOption:             "true",
+				cpumanager.DistributeCPUsAcrossCoresOption: "false",
+			},
+		},
+		{
+			name:  string(cpumanager.PolicyStatic),
+			title: ", alongside CPU Manager Static Policy with FullPCPUsOnlyOption, AlignBySocketOption",
+			options: map[string]string{
+				cpumanager.FullPCPUsOnlyOption:             "true",
+				cpumanager.DistributeCPUsAcrossNUMAOption:  "false",
+				cpumanager.AlignBySocketOption:             "true",
+				cpumanager.DistributeCPUsAcrossCoresOption: "false",
+			},
+		},
+		{
+			name:  string(cpumanager.PolicyStatic),
+			title: ", alongside CPU Manager Static Policy with DistributeCPUsAcrossNUMAOption, AlignBySocketOption",
+			options: map[string]string{
+				cpumanager.FullPCPUsOnlyOption:             "false",
+				cpumanager.DistributeCPUsAcrossNUMAOption:  "true",
+				cpumanager.AlignBySocketOption:             "true",
+				cpumanager.DistributeCPUsAcrossCoresOption: "false",
+			},
+		},
+		{
+			name:  string(cpumanager.PolicyStatic),
+			title: ", alongside CPU Manager Static Policy with FullPCPUsOnlyOption, DistributeCPUsAcrossNUMAOption, AlignBySocketOption",
+			options: map[string]string{
+				cpumanager.FullPCPUsOnlyOption:             "true",
+				cpumanager.DistributeCPUsAcrossNUMAOption:  "true",
+				cpumanager.AlignBySocketOption:             "true",
+				cpumanager.DistributeCPUsAcrossCoresOption: "false",
+			},
+		},
+		{
+			name:  string(cpumanager.PolicyStatic),
+			title: ", alongside CPU Manager Static Policy with DistributeCPUsAcrossCoresOption",
+			options: map[string]string{
+				cpumanager.FullPCPUsOnlyOption:             "false",
+				cpumanager.DistributeCPUsAcrossNUMAOption:  "false",
+				cpumanager.AlignBySocketOption:             "false",
+				cpumanager.DistributeCPUsAcrossCoresOption: "true",
+			},
+		},
+		{
+			name:  string(cpumanager.PolicyStatic),
+			title: ", alongside CPU Manager Static Policy with DistributeCPUsAcrossCoresOption, AlignBySocketOption",
+			options: map[string]string{
+				cpumanager.FullPCPUsOnlyOption:             "false",
+				cpumanager.DistributeCPUsAcrossNUMAOption:  "false",
+				cpumanager.AlignBySocketOption:             "true",
+				cpumanager.DistributeCPUsAcrossCoresOption: "true",
+			},
+		},
+	}
+
+	for idp := range policiesAlpha {
+		doPodResizeTests(policiesAlpha[idp])
+	}*/
+
 	doPodResizeErrorTests(f)
 })
