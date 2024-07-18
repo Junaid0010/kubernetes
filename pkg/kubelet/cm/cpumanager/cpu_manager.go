@@ -257,6 +257,7 @@ func (m *manager) Allocate(p *v1.Pod, c *v1.Container) error {
 	defer m.Unlock()
 
 	// Call down into the policy to assign this container CPUs if required.
+	klog.InfoS("jjs allocate call")
 	err := m.policy.Allocate(m.state, p, c)
 	if err != nil {
 		klog.ErrorS(err, "Allocate error")
@@ -522,7 +523,6 @@ func (m *manager) updateContainerCPUSet(ctx context.Context, containerID string,
 	// It would be better to pass the full container resources here instead of
 	// this patch-like partial resources.
 
-	//TODO something like this when https://github.com/kubernetes/kubernetes/pull/124285/files comes along
 	if runtime.GOOS == "windows" {
 		klog.Info("Updating windows CPU affinity")
 

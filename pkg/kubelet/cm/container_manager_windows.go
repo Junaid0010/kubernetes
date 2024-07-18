@@ -27,6 +27,7 @@ import (
 	"fmt"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	kubefeatures "k8s.io/kubernetes/pkg/features"
+	"sync"
 
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
@@ -39,7 +40,6 @@ import (
 	internalapi "k8s.io/cri-api/pkg/apis"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
-	"k8s.io/kubernetes/pkg/kubelet/cm/admission"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
 	"k8s.io/kubernetes/pkg/kubelet/cm/devicemanager"
 	"k8s.io/kubernetes/pkg/kubelet/cm/memorymanager"
@@ -66,12 +66,8 @@ type containerManagerImpl struct {
 	topologyManager topologymanager.Manager
 	cpuManager      cpumanager.Manager
 	memoryManager   memorymanager.Manager
-}
-
-type noopWindowsResourceAllocator struct{}
-
-func (ra *noopWindowsResourceAllocator) Admit(attrs *lifecycle.PodAdmitAttributes) lifecycle.PodAdmitResult {
-	return admission.GetPodAdmitResult(nil)
+	nodeInfo        *v1.Node
+	sync.RWMutex
 }
 
 func (cm *containerManagerImpl) Start(ctx context.Context, node *v1.Node,
@@ -81,6 +77,8 @@ func (cm *containerManagerImpl) Start(ctx context.Context, node *v1.Node,
 	runtimeService internalapi.RuntimeService,
 	localStorageCapacityIsolation bool) error {
 	klog.V(2).InfoS("Starting Windows container manager")
+
+	cm.nodeInfo = node
 
 	if localStorageCapacityIsolation {
 		rootfs, err := cm.cadvisorInterface.RootFsInfo()
@@ -193,7 +191,9 @@ func (cm *containerManagerImpl) SystemCgroupsLimit() v1.ResourceList {
 }
 
 func (cm *containerManagerImpl) GetNodeConfig() NodeConfig {
-	return NodeConfig{}
+	cm.RLock()
+	defer cm.RUnlock()
+	return cm.nodeConfig
 }
 
 func (cm *containerManagerImpl) GetMountedSubsystems() *CgroupSubsystems {
@@ -304,7 +304,7 @@ func (cm *containerManagerImpl) ShouldResetExtendedResourceCapacity() bool {
 }
 
 func (cm *containerManagerImpl) GetAllocateResourcesPodAdmitHandler() lifecycle.PodAdmitHandler {
-	return &noopWindowsResourceAllocator{}
+	return cm.topologyManager
 }
 
 func (cm *containerManagerImpl) UpdateAllocatedDevices() {
