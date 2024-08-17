@@ -8,6 +8,12 @@
     lockToDefault: false
     preRelease: Beta
     version: "1.32"
+- name: BtreeWatchCache
+  versionedSpecs:
+  - default: true
+    lockToDefault: false
+    preRelease: Beta
+    version: "1.32"
 - name: RelaxedEnvironmentVariableValidation
   versionedSpecs:
   - default: false
