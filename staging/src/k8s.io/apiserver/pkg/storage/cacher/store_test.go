@@ -28,7 +28,7 @@ import (
 )
 
 func TestStoreSingleKey(t *testing.T) {
-	store := newStoreIndexer(nil)
+	store := newThreadedBtreeStoreIndexer(nil, 32)
 	assertStoreEmpty(t, store, "foo")
 
 	require.NoError(t, store.Add(testStorageElement("foo", "bar", 1)))
@@ -50,7 +50,7 @@ func TestStoreSingleKey(t *testing.T) {
 }
 
 func TestStoreIndexerSingleKey(t *testing.T) {
-	store := newStoreIndexer(testStoreIndexers())
+	store := newThreadedBtreeStoreIndexer(storeElementIndexers(testStoreIndexers()), 32)
 	items, err := store.ByIndex("by_val", "bar")
 	require.NoError(t, err)
 	assert.Empty(t, items)
