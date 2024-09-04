@@ -119,7 +119,7 @@ type PROCESSOR_GROUP_INFO struct {
 
 type processor struct {
 	CoreID   int
-	SocektID int
+	SocketID int
 	NodeID   int
 }
 
@@ -183,7 +183,7 @@ func processorInfo(relationShip RelationType) (int, int, []cadvisorapi.Node, err
 						p.CoreID = numOfcores
 					}
 					if RelationProcessorPackage == (RelationType)(info.Relationship) {
-						p.SocektID = numofSockets
+						p.SocketID = numofSockets
 					}
 				}
 			}
@@ -237,7 +237,7 @@ func processorInfo(relationShip RelationType) (int, int, []cadvisorapi.Node, err
 		if !ok {
 			return 0, 0, nil, fmt.Errorf("Core not found: %d", p.CoreID)
 		}
-		node.Cores[coreIdx].SocketID = p.SocektID
+		node.Cores[coreIdx].SocketID = p.SocketID
 		nodes[p.NodeID] = node
 	}
 
