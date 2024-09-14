@@ -1,8 +1,11 @@
 package winstats
 
 import (
+	"fmt"
+	cadvisorapi "github.com/google/cadvisor/info/v1"
 	"github.com/stretchr/testify/assert"
 	"testing"
+	"unsafe"
 )
 
 func TestGROUP_AFFINITY_Processors(t *testing.T) {
@@ -197,4 +200,177 @@ func TestCpusToGroupAffinity(t *testing.T) {
 			assert.Equalf(t, tt.want, CpusToGroupAffinity(tt.cpus), "CpusToGroupAffinity(%v)", tt.cpus)
 		})
 	}
+}
+
+func Test_convertWinApiToCadvisorApi(t *testing.T) {
+	tests := []struct {
+		name                 string
+		buffer               []byte
+		expectedNumOfCores   int
+		expectedNumOfSockets int
+		expectedNodes        []cadvisorapi.Node
+		wantErr              assert.ErrorAssertionFunc
+	}{
+		{
+			name:                 "empty",
+			buffer:               []byte{},
+			expectedNumOfCores:   0,
+			expectedNumOfSockets: 0,
+			expectedNodes:        []cadvisorapi.Node{},
+			wantErr:              assert.NoError,
+		},
+		{
+			name:                 "single core",
+			buffer:               createProcessorRelationships([]int{0}),
+			expectedNumOfCores:   1,
+			expectedNumOfSockets: 1,
+			expectedNodes: []cadvisorapi.Node{
+				{
+					Id: 0,
+					Cores: []cadvisorapi.Core{
+						{
+							Id:      1,
+							Threads: []int{0},
+						},
+					},
+				},
+			},
+			wantErr: assert.NoError,
+		},
+		{
+			name:                 "single core, multiple cpus",
+			buffer:               createProcessorRelationships([]int{0, 1, 2}),
+			expectedNumOfCores:   1,
+			expectedNumOfSockets: 1,
+			expectedNodes: []cadvisorapi.Node{
+				{
+					Id: 0,
+					Cores: []cadvisorapi.Core{
+						{
+							Id:      1,
+							Threads: []int{0, 1, 2},
+						},
+					},
+				},
+			},
+			wantErr: assert.NoError,
+		},
+		{
+			name:                 "single core, multiple groups",
+			buffer:               createProcessorRelationships([]int{0, 64}),
+			expectedNumOfCores:   1,
+			expectedNumOfSockets: 1,
+			expectedNodes: []cadvisorapi.Node{
+				{
+					Id: 0,
+					Cores: []cadvisorapi.Core{
+						{
+							Id:      1,
+							Threads: []int{0, 64},
+						},
+					},
+				},
+			},
+			wantErr: assert.NoError,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			numOfCores, numOfSockets, nodes, err := convertWinApiToCadvisorApi(tt.buffer)
+			if !tt.wantErr(t, err, fmt.Sprintf("convertWinApiToCadvisorApi(%v)", tt.name)) {
+				return
+			}
+			assert.Equalf(t, tt.expectedNumOfCores, numOfCores, "num of cores")
+			assert.Equalf(t, tt.expectedNumOfSockets, numOfSockets, "num of sockets")
+			for node := range nodes {
+				assert.Equalf(t, tt.expectedNodes[node].Id, nodes[node].Id, "node id")
+				for core := range nodes[node].Cores {
+					assert.Equalf(t, tt.expectedNodes[node].Cores[core].Id, nodes[node].Cores[core].Id, "core id")
+					assert.Equalf(t, tt.expectedNodes[node].Cores[core].Threads, nodes[node].Cores[core].Threads, "threads")
+				}
+			}
+		})
+	}
+}
+
+func genbuffer(infos ...SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) []byte {
+	var buffer []byte
+	for _, info := range infos {
+		buffer = append(buffer, structToBytes(info)...)
+	}
+	return buffer
+}
+
+func createProcessorRelationships(cpus []int) []byte {
+	groups := CpusToGroupAffinity(cpus)
+	grouplen := len(groups)
+	groupAffinities := make([]GROUP_AFFINITY, 0, grouplen)
+	for _, group := range groups {
+		groupAffinities = append(groupAffinities, *group)
+	}
+	return genbuffer(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX{
+		Relationship: uint32(RelationProcessorCore),
+		Size:         uint32(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX_SIZE + PROCESSOR_RELATIONSHIP_SIZE + (GROUP_AFFINITY_SIZE * grouplen)),
+		data: PROCESSOR_RELATIONSHIP{
+			Flags:           0,
+			EfficiencyClass: 0,
+			Reserved:        [20]byte{},
+			GroupCount:      uint16(grouplen),
+			GroupMasks:      groupAffinities,
+		},
+	}, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX{
+		Relationship: uint32(RelationNumaNode),
+		Size:         uint32(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX_SIZE + NUMA_NODE_RELATIONSHIP_SIZE + (GROUP_AFFINITY_SIZE * grouplen)),
+		data: NUMA_NODE_RELATIONSHIP{
+			NodeNumber: 0,
+			Reserved:   [18]byte{},
+			GroupCount: uint16(grouplen),
+			GroupMasks: groupAffinities,
+		}}, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX{
+		Relationship: uint32(RelationProcessorPackage),
+		Size:         uint32(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX_SIZE + PROCESSOR_RELATIONSHIP_SIZE + (GROUP_AFFINITY_SIZE * grouplen)),
+		data: PROCESSOR_RELATIONSHIP{
+			Flags:           0,
+			EfficiencyClass: 0,
+			Reserved:        [20]byte{},
+			GroupCount:      uint16(grouplen),
+			GroupMasks:      groupAffinities,
+		},
+	})
+}
+
+const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX_SIZE = 8
+const PROCESSOR_RELATIONSHIP_SIZE = 24
+const NUMA_NODE_RELATIONSHIP_SIZE = 24
+const GROUP_AFFINITY_SIZE = int(unsafe.Sizeof(GROUP_AFFINITY{})) // this one is known at compile time
+
+func structToBytes(info SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) []byte {
+	var pri []byte = (*(*[SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX_SIZE]byte)(unsafe.Pointer(&info)))[:SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX_SIZE]
+
+	switch info.data.(type) {
+	case PROCESSOR_RELATIONSHIP:
+		rel := info.data.(PROCESSOR_RELATIONSHIP)
+		var prBytes []byte = (*(*[PROCESSOR_RELATIONSHIP_SIZE]byte)(unsafe.Pointer(&rel)))[:PROCESSOR_RELATIONSHIP_SIZE]
+		pri = append(pri, prBytes...)
+
+		groupAffinities := rel.GroupMasks.([]GROUP_AFFINITY)
+
+		for _, groupAffinity := range groupAffinities {
+			var groupByte []byte = (*(*[GROUP_AFFINITY_SIZE]byte)(unsafe.Pointer(&groupAffinity)))[:]
+			pri = append(pri, groupByte...)
+		}
+	case NUMA_NODE_RELATIONSHIP:
+		numa := info.data.(NUMA_NODE_RELATIONSHIP)
+		var nameBytes []byte = (*(*[NUMA_NODE_RELATIONSHIP_SIZE]byte)(unsafe.Pointer(&numa)))[:NUMA_NODE_RELATIONSHIP_SIZE]
+		pri = append(pri, nameBytes...)
+
+		groupAffinities := numa.GroupMasks.([]GROUP_AFFINITY)
+
+		for _, groupAffinity := range groupAffinities {
+			var groupByte []byte = (*(*[GROUP_AFFINITY_SIZE]byte)(unsafe.Pointer(&groupAffinity)))[:]
+			pri = append(pri, groupByte...)
+		}
+	}
+
+	return pri
 }

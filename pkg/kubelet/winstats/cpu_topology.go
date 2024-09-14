@@ -148,15 +148,20 @@ func processorInfo(relationShip RelationType) (int, int, []cadvisorapi.Node, err
 		return 0, 0, nil, fmt.Errorf("Call to GetLogicalProcessorInformationEx failed: %v", err)
 	}
 
-	processors := make(map[int]*processor)
+	return convertWinApiToCadvisorApi(buffer)
+}
+
+func convertWinApiToCadvisorApi(buffer []byte) (int, int, []cadvisorapi.Node, error) {
+	logicalProcessors := make(map[int]*processor)
 	numofSockets := 0
 	numOfcores := 0
-	var nodes []cadvisorapi.Node
+	nodes := []cadvisorapi.Node{}
 	//iterate over the buffer casting it to the correct type
 	for offset := 0; offset < len(buffer); {
+		//todo check if there is enough left in buffer to read system_logical_processor_information_ex?
 		info := (*SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(unsafe.Pointer(&buffer[offset]))
 		switch (RelationType)(info.Relationship) {
-		case RelationProcessorCore, RelationProcessorPackage, RelationProcessorModule:
+		case RelationProcessorCore, RelationProcessorPackage:
 			processorRelationship := (*PROCESSOR_RELATIONSHIP)(unsafe.Pointer(&info.data))
 			groupMasks := make([]GROUP_AFFINITY, processorRelationship.GroupCount)
 			for i := 0; i < int(processorRelationship.GroupCount); i++ {
@@ -173,11 +178,11 @@ func processorInfo(relationShip RelationType) (int, int, []cadvisorapi.Node, err
 
 			//iterate over group masks and add each processor to the map
 			for _, groupMask := range groupMasks {
-				for processorId := range groupMask.Processors() {
-					p, ok := processors[processorId]
+				for _, processorId := range groupMask.Processors() {
+					p, ok := logicalProcessors[processorId]
 					if !ok {
 						p = &processor{}
-						processors[processorId] = p
+						logicalProcessors[processorId] = p
 					}
 					if RelationProcessorCore == (RelationType)(info.Relationship) {
 						p.CoreID = numOfcores
@@ -199,10 +204,10 @@ func processorInfo(relationShip RelationType) (int, int, []cadvisorapi.Node, err
 
 			for _, groupMask := range groupMasks {
 				for processorId := range groupMask.Processors() {
-					p, ok := processors[processorId]
+					p, ok := logicalProcessors[processorId]
 					if !ok {
 						p = &processor{}
-						processors[processorId] = p
+						logicalProcessors[processorId] = p
 					}
 					p.NodeID = int(numaNodeRelationship.NodeNumber)
 				}
@@ -220,7 +225,7 @@ func processorInfo(relationShip RelationType) (int, int, []cadvisorapi.Node, err
 		offset += int(info.Size)
 	}
 
-	for processId, p := range processors {
+	for processId, p := range logicalProcessors {
 		klog.V(4).Infof("Processor (%d): %v", processId, p)
 		node := nodes[p.NodeID]
 		if node.Id != p.NodeID {
