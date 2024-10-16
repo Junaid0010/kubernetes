@@ -317,6 +317,15 @@ func (d CPUDetails) CPUsInCores(ids ...int) cpuset.CPUSet {
 	return cpuset.New(cpuIDs...)
 }
 
+func getUncoreCacheID(uncoreCaches []cadvisorapi.Cache) int {
+	if len(uncoreCaches) < 1 {
+		return 0
+	}
+	// Even though cadvisor API returns a slice, we only expect either 0 or a 1 uncore caches,
+	// so everything past the first entry should be discarded or ignored
+	return uncoreCaches[0].Id
+}
+
 // Discover returns CPUTopology based on cadvisor node info
 func Discover(machineInfo *cadvisorapi.MachineInfo) (*CPUTopology, error) {
 	if machineInfo.NumCores == 0 {
@@ -335,7 +344,7 @@ func Discover(machineInfo *cadvisorapi.MachineInfo) (*CPUTopology, error) {
 						CoreID:        coreID,
 						SocketID:      core.SocketID,
 						NUMANodeID:    node.Id,
-						UnCoreCacheID: core.UncoreCaches[0].Id,
+						UnCoreCacheID: getUncoreCacheID(core.UncoreCaches),
 					}
 				}
 			} else {
