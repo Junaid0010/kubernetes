@@ -175,7 +175,7 @@ func populateStatuszData(tmpl *template.Template) (string, error) {
 	var tpl bytes.Buffer
 	err := tmpl.Execute(&tpl, data)
 	if err != nil {
-		return "", fmt.Errorf("error executing statusz template: %v", err)
+		return "", fmt.Errorf("error executing statusz template: %w", err)
 	}
 
 	return tpl.String(), nil

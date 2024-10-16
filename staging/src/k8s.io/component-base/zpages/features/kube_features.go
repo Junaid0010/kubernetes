@@ -30,7 +30,7 @@ const (
 
 func featureGates() map[featuregate.Feature]featuregate.FeatureSpec {
 	return map[featuregate.Feature]featuregate.FeatureSpec{
-		ComponentStatusz: featuregate.FeatureSpec{Version: version.MustParse("1.32"), Default: false, PreRelease: featuregate.Alpha},
+		ComponentStatusz: {Version: version.MustParse("1.32"), Default: false, PreRelease: featuregate.Alpha},
 	}
 }
 
