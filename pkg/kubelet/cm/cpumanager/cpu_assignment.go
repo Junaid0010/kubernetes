@@ -120,7 +120,7 @@ func (n *numaFirst) takeFullSecondLevel() {
 	n.acc.takeFullSockets()
 }
 
-// In Split L3 Topology, we take from the sets of uncorecache as the third level
+// In Split UncoreCache Topology, we take from the sets of UncoreCache as the third level
 func (n *numaFirst) takeThirdLevel() {
 	n.acc.takeUnCoreCache()
 }
@@ -207,7 +207,7 @@ func (s *socketsFirst) sortAvailableSockets() []int {
 	return sockets
 }
 
-// If sockets  higher in the memory hierarchy than NUMA nodes, then uncorecache
+// If sockets  higher in the memory hierarchy than NUMA nodes, then UncoreCache
 // sit directly below NUMA Nodes in the memory hierchy
 func (s *socketsFirst) sortAvailableUnCoreCaches() []int {
 	var result []int
@@ -400,9 +400,7 @@ func (a *cpuAccumulator) freeUnCoreCache() []int {
 
 // Returns all UnCoreCache IDs as a slice sorted by sortAvailableUnCoreCache().
 func (a *cpuAccumulator) allUnCoreCache() []int {
-	all := []int{}
-	all = append(all, a.numaOrSocketsFirst.sortAvailableUnCoreCaches()...)
-	return all
+	return a.numaOrSocketsFirst.sortAvailableUnCoreCaches()
 }
 
 // Returns free core IDs as a slice sorted by sortAvailableCores().
@@ -583,18 +581,15 @@ func (a *cpuAccumulator) takeFullUnCore() {
 		if !a.needsAtLeast(cpusInUnCore.Size()) {
 			continue
 		}
-		klog.V(4).InfoS("takeFullCCD: claiming CCD", "uncore", uncore)
 		a.take(cpusInUnCore)
 	}
 }
 
-// First try to take partial uncorecache (CCD), if available and the request size can fit w/in the uncorecache.
-// Second try to take the full CCD if available and need is at least the size of the uncorecache group.
+// First try to take partial UncoreCache, if available and the request size can fit w/in the UncoreCache.
+// Second try to take the full UncoreCache if available and need is at least the size of the UncoreCache group.
 func (a *cpuAccumulator) takeUnCoreCache() {
-	// check if SMT ON
-
 	for _, uncore := range a.allUnCoreCache() {
-		numCoresNeeded := a.numCPUsNeeded / a.topo.CPUsPerCore() // this is another new change
+		numCoresNeeded := a.numCPUsNeeded / a.topo.CPUsPerCore()
 
 		var freeCPUsInUncorecache cpuset.CPUSet
 		// need to get needed cores in uncorecache
