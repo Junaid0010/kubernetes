@@ -79,6 +79,8 @@ import (
 	"k8s.io/component-base/metrics/features"
 	"k8s.io/component-base/metrics/prometheus/slis"
 	"k8s.io/component-base/tracing"
+	zpagesfeatures "k8s.io/component-base/zpages/features"
+	"k8s.io/component-base/zpages/statusz"
 	"k8s.io/klog/v2"
 	openapicommon "k8s.io/kube-openapi/pkg/common"
 	"k8s.io/kube-openapi/pkg/spec3"
@@ -94,7 +96,8 @@ import (
 // To be used for testing purpose only, to simulate scenarios where multiple apiservers
 // exist. In such cases we want to ensure unique apiserver IDs which are a hash of hostnameFunc.
 var (
-	hostnameFunc = os.Hostname
+	hostnameFunc  = os.Hostname
+	componentName = "apiserver"
 )
 
 const (
@@ -378,6 +381,7 @@ type AuthorizationInfo struct {
 
 func init() {
 	utilruntime.Must(features.AddFeatureGates(utilfeature.DefaultMutableFeatureGate))
+	utilruntime.Must(zpagesfeatures.AddFeatureGates(utilfeature.DefaultMutableFeatureGate))
 }
 
 // NewConfig returns a Config struct with the default values
@@ -1100,6 +1104,10 @@ func installAPI(s *GenericAPIServer, c *Config) {
 			routes.DefaultMetrics{}.Install(s.Handler.NonGoRestfulMux)
 			slis.SLIMetrics{}.Install(s.Handler.NonGoRestfulMux)
 		}
+	}
+
+	if c.FeatureGate.Enabled(zpagesfeatures.ComponentStatusz) {
+		statusz.Install(s.Handler.NonGoRestfulMux, componentName)
 	}
 
 	routes.Version{Version: c.EffectiveVersion.BinaryVersion().Info()}.Install(s.Handler.GoRestfulContainer)
