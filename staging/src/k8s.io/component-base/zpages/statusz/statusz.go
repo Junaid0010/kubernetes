@@ -24,7 +24,6 @@ import (
 	"strings"
 	"time"
 
-	"k8s.io/apiserver/pkg/endpoints/metrics"
 	"k8s.io/klog/v2"
 )
 
@@ -105,17 +104,7 @@ func parseTmpl(tmpl string) (*template.Template, error) {
 }
 
 func Install(m mux, componentName string) {
-	m.Handle("/statusz",
-		metrics.InstrumentHandlerFunc("GET",
-			/* group = */ "",
-			/* version = */ "",
-			/* resource = */ "",
-			/* subresource = */ "/statusz",
-			/* scope = */ "",
-			/* component = */ "",
-			/* deprecated */ false,
-			/* removedRelease */ "",
-			handleStatusz(componentName, headerTmpl, dataTmpl)))
+	m.Handle("/statusz", handleStatusz(componentName, headerTmpl, dataTmpl))
 }
 
 func handleStatusz(componentName string, headerTmpl, dataTmpl *template.Template) http.HandlerFunc {
