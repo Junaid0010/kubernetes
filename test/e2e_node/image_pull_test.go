@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 /*
 Copyright 2024 The Kubernetes Authors.
 
@@ -18,7 +21,9 @@ package e2enode
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/onsi/ginkgo/v2"
@@ -40,7 +45,7 @@ import (
 
 // This test needs to run in serial to prevent caching of the images by other tests
 // and to prevent the wait time of image pulls to be increased by other images
-var _ = SIGDescribe("Pull Image", framework.WithSerial(), feature.MaxParallelImagePull, feature.CriProxy, func() {
+var _ = SIGDescribe("Pull Image", feature.CriProxy, framework.WithSerial(), func() {
 
 	f := framework.NewDefaultFramework("parallel-pull-image-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
@@ -72,10 +77,27 @@ var _ = SIGDescribe("Pull Image", framework.WithSerial(), feature.MaxParallelIma
 		})
 
 		ginkgo.It("should pull immediately if no more than 5 pods", func(ctx context.Context) {
+			var wg sync.WaitGroup
+			timeout := 20 * time.Second
+			callCh := make(chan int)
+			callStatus := make(map[int]chan struct{})
+			var mu sync.Mutex
 			err := addCRIProxyInjector(func(apiName string) error {
 				if apiName == criproxy.PullImage {
-					time.Sleep(15 * time.Second)
-					return nil
+					defer wg.Done()
+					mu.Lock()
+					callID := len(callStatus) + 1
+					callStatus[callID] = make(chan struct{})
+					mu.Unlock()
+
+					select {
+					case <-callCh:
+						fmt.Printf("Call %d completed successfully\n", callID)
+						return nil
+					case <-time.After(timeout):
+						fmt.Printf("Call %d timed out\n", callID)
+						return fmt.Errorf("no parallel image pull after %s", timeout)
+					}
 				}
 				return nil
 			})
@@ -103,7 +125,7 @@ var _ = SIGDescribe("Pull Image", framework.WithSerial(), feature.MaxParallelIma
 	})
 })
 
-var _ = SIGDescribe("Pull Image", framework.WithSerial(), feature.MaxParallelImagePull, func() {
+var _ = SIGDescribe("Pull Image", feature.CriProxy, framework.WithSerial(), func() {
 
 	f := framework.NewDefaultFramework("serialize-pull-image-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
@@ -123,6 +145,7 @@ var _ = SIGDescribe("Pull Image", framework.WithSerial(), feature.MaxParallelIma
 			}
 
 			testpods = prepareAndCleanup(ctx, f)
+			gomega.Expect(len(testpods)).To(gomega.BeNumerically("<=", 5))
 		})
 
 		ginkgo.AfterEach(func(ctx context.Context) {
@@ -136,10 +159,32 @@ var _ = SIGDescribe("Pull Image", framework.WithSerial(), feature.MaxParallelIma
 		})
 
 		ginkgo.It("should be waiting more", func(ctx context.Context) {
+			// all serialize image pulls should timeout
+			timeout := 10 * time.Second
+			var mu sync.Mutex
+			callCh := make(chan struct{})
+			callStatus := make(map[int]chan struct{})
 			err := addCRIProxyInjector(func(apiName string) error {
 				if apiName == criproxy.PullImage {
-					time.Sleep(15 * time.Second)
-					return nil
+					mu.Lock()
+					callID := len(callStatus)
+					callStatus[callID] = callCh
+					mu.Unlock()
+
+					if callID == 0 {
+						// wait for next call
+						select {
+						case <-callCh:
+							fmt.Printf("Call %d completed successfully\n", callID)
+							return errors.New("parallel image pull detected")
+						case <-time.After(timeout):
+							fmt.Printf("Call %d timed out\n", callID)
+							return nil
+						}
+					} else {
+						// send a signal to the first call
+						callCh <- struct{}{}
+					}	
 				}
 				return nil
 			})
@@ -217,9 +262,9 @@ func getPodImagePullDurations(ctx context.Context, f *framework.Framework, testp
 // as pods are created at the same time and image pull will delay 15s, the image pull time should be overlapped
 func checkPodPullingOverlap(podStartTime map[string]metav1.Time, podEndTime map[string]metav1.Time, testpods []*v1.Pod) {
 	if podStartTime[testpods[0].Name].Time.Before(podStartTime[testpods[1].Name].Time) && podEndTime[testpods[0].Name].Time.Before(podStartTime[testpods[1].Name].Time) {
-		framework.Failf("v% pulling time and v% pulling time are not overlapped", testpods[0].Name, testpods[1].Name)
+		framework.Failf("%v pulling time and %v pulling time are not overlapped", testpods[0].Name, testpods[1].Name)
 	} else if podStartTime[testpods[0].Name].Time.After(podStartTime[testpods[1].Name].Time) && podStartTime[testpods[0].Name].Time.After(podEndTime[testpods[1].Name].Time) {
-		framework.Failf("v% pulling time and v% pulling time are not overlapped", testpods[0].Name, testpods[1].Name)
+		framework.Failf("%v pulling time and %v pulling time are not overlapped", testpods[0].Name, testpods[1].Name)
 	}
 }
 
